@@ -1,155 +1,136 @@
+# sim_so.py
+import json
+import argparse
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-import argparse, json
+from typing import List, Optional, Dict
+from collections import deque
 
-# ---------------------------
-# PCB: Proceso (mínimo pedido)
-# ---------------------------
-@dataclass(order=True)
+# =========================
+# 1) Modelo de Proceso (PCB)
+# =========================
+@dataclass
 class Process:
     pid: int
     llegada: int
     servicio: int
     inicio: Optional[int] = None
     fin: Optional[int] = None
-    restante: int = field(init=False, compare=False)
+    restante: int = field(init=False)
 
     def __post_init__(self):
         self.restante = self.servicio
 
-    def metrics(self):
-        if self.inicio is None or self.fin is None:
-            raise ValueError("Proceso no finalizado: no hay métricas.")
-        respuesta = self.inicio - self.llegada
-        retorno = self.fin - self.llegada
-        espera = retorno - self.servicio
-        return {
-            "PID": self.pid, "Llegada": self.llegada, "Servicio": self.servicio,
-            "Inicio": self.inicio, "Fin": self.fin, "Respuesta": respuesta,
-            "Espera": espera, "Retorno": retorno
-        }
 
-# ---------------------------
-# Planificadores
-# ---------------------------
-class SchedulerBase:
-    def select(self, ready: List[Process], t:int) -> Optional[Process]:
-        raise NotImplementedError
-
-class FCFS(SchedulerBase):
-    def select(self, ready: List[Process], t:int) -> Optional[Process]:
-        if not ready:
-            return None
-        return ready.pop(0)  # FIFO
-
-class SPN(SchedulerBase):  # SJF no expropiativo
-    def select(self, ready: List[Process], t:int) -> Optional[Process]:
-        if not ready:
-            return None
-        idx = min(range(len(ready)),
-                  key=lambda i: (ready[i].restante, ready[i].llegada, ready[i].pid))
-        return ready.pop(idx)
-
-class RR(SchedulerBase):
-    def __init__(self, quantum:int):
-        assert quantum >= 2, "Quantum debe ser ≥ 2"
-        self.quantum = quantum
-        self.time_slice_left = 0
-        self.current: Optional[Process] = None
-
-    def tick(self, ready: List[Process], t:int) -> Optional[Process]:
-        # Despacho si la CPU está libre
-        if self.current is None and ready:
-            self.current = ready.pop(0)
-            self.time_slice_left = self.quantum
-            if self.current.inicio is None:
-                self.current.inicio = t
-
-        # Ejecuta 1 tick
-        if self.current is not None:
-            self.current.restante -= 1
-            self.time_slice_left -= 1
-            finished = False
-            if self.current.restante == 0:
-                self.current.fin = t + 1
-                finished = True
-
-            if finished:
-                done = self.current
-                self.current = None
-                return done
-
-            if self.time_slice_left == 0:
-                # Expropiación y reencolado
-                ready.append(self.current)
-                self.current = None
-        return None
-
-# ---------------------------
-# Motor de simulación de CPU
-# ---------------------------
-def simulate_cpu(processes: List[Process], policy:str, quantum:int=2, context_switch:int=0):
-    arrivals = sorted(processes, key=lambda p: (p.llegada, p.pid))
-    ready: List[Process] = []
-    completed: List[Process] = []
+# =========================
+# 2) Planificadores de CPU
+# =========================
+def fcfs(procesos: List[Process]) -> List[Process]:
     t = 0
-    current: Optional[Process] = None
-    rr = RR(quantum) if policy == "RR" else None
+    orden = sorted(procesos, key=lambda p: (p.llegada, p.pid))
+    for p in orden:
+        if t < p.llegada:
+            t = p.llegada
+        p.inicio = t
+        t += p.servicio
+        p.fin = t
+    return orden
 
-    while len(completed) < len(processes):
-        # 1) Arribos
-        while arrivals and arrivals[0].llegada == t:
-            ready.append(arrivals.pop(0))
+def spn(procesos: List[Process]) -> List[Process]:
+    t = 0
+    pendientes = sorted(procesos, key=lambda p: (p.llegada, p.pid))
+    ready: List[Process] = []
+    terminados: List[Process] = []
 
-        if policy == "RR":
-            done = rr.tick(ready, t)
-            if done:
-                completed.append(done)
-                if context_switch > 0 and (rr.current is not None or ready):
-                    t += context_switch
+    while pendientes or ready:
+        while pendientes and pendientes[0].llegada <= t:
+            ready.append(pendientes.pop(0))
+        if not ready:
+            # nadie listo: saltamos al próximo arribo
+            t = pendientes[0].llegada
+            continue
+        # menor servicio; empate -> menor llegada -> menor pid
+        ready.sort(key=lambda p: (p.servicio, p.llegada, p.pid))
+        p = ready.pop(0)
+        if p.inicio is None:
+            p.inicio = t
+        t += p.servicio
+        p.fin = t
+        terminados.append(p)
+    return terminados
+
+def rr(procesos: List[Process], quantum: int) -> List[Process]:
+    if quantum < 2:
+        raise ValueError("Quantum debe ser ≥ 2 para RR.")
+    t = 0
+    llegada_orden = sorted(procesos, key=lambda p: (p.llegada, p.pid))
+    i = 0
+    cola = deque()
+    terminados: List[Process] = []
+
+    while i < len(llegada_orden) or cola:
+        # encolar los que llegaron hasta t
+        while i < len(llegada_orden) and llegada_orden[i].llegada <= t:
+            cola.append(llegada_orden[i])
+            i += 1
+        if not cola:
+            # saltar al próximo arribo
+            t = llegada_orden[i].llegada
+            continue
+
+        p = cola.popleft()
+        if p.inicio is None:
+            p.inicio = t
+        run = min(quantum, p.restante)
+        t += run
+        p.restante -= run
+
+        # llegan procesos mientras corre el quantum
+        while i < len(llegada_orden) and llegada_orden[i].llegada <= t:
+            cola.append(llegada_orden[i])
+            i += 1
+
+        if p.restante > 0:
+            cola.append(p)      # reencolar
         else:
-            # Despacho
-            if current is None and ready:
-                if policy == "FCFS":
-                    current = FCFS().select(ready, t)
-                elif policy == "SPN":
-                    current = SPN().select(ready, t)
-                else:
-                    raise ValueError("Política desconocida")
-                if current.inicio is None:
-                    current.inicio = t
+            p.fin = t
+            terminados.append(p)
 
-            # Ejecuta 1 tick
-            if current is not None:
-                current.restante -= 1
-                if current.restante == 0:
-                    current.fin = t + 1
-                    completed.append(current)
-                    current = None
-                    if context_switch > 0 and ready:
-                        t += context_switch
+    return terminados
 
-        t += 1
 
-    # Métricas y resumen
-    tabla = [p.metrics() for p in sorted(completed, key=lambda x: x.pid)]
-    avg_resp = sum(r["Respuesta"] for r in tabla) / len(tabla)
-    avg_wait = sum(r["Espera"] for r in tabla) / len(tabla)
-    avg_turn = sum(r["Retorno"] for r in tabla) / len(tabla)
-    total_time = max(r["Fin"] for r in tabla)
-    throughput = len(tabla) / total_time if total_time > 0 else 0
+# =========================
+# 3) Cálculo de métricas
+# =========================
+def calcular_metricas(finalizados: List[Process]):
+    tabla = []
+    tot_resp = tot_esp = tot_ret = 0
+    for p in finalizados:
+        resp = p.inicio - p.llegada
+        ret = p.fin - p.llegada
+        esp = ret - p.servicio
+        tot_resp += resp
+        tot_esp += esp
+        tot_ret += ret
+        tabla.append({
+            "PID": p.pid, "Llegada": p.llegada, "Servicio": p.servicio,
+            "Inicio": p.inicio, "Fin": p.fin, "Respuesta": resp,
+            "Espera": esp, "Retorno": ret
+        })
+    n = len(finalizados)
+    t_total = max(p.fin for p in finalizados) if n else 0
     resumen = {
-        "Promedio_Respuesta": avg_resp,
-        "Promedio_Espera": avg_wait,
-        "Promedio_Retorno": avg_turn,
-        "Throughput": throughput,
-        "Tiempo_Total": total_time
+        "Promedio_Respuesta": tot_resp / n if n else 0.0,
+        "Promedio_Espera":    tot_esp  / n if n else 0.0,
+        "Promedio_Retorno":   tot_ret  / n if n else 0.0,
+        "Throughput": (n / t_total) if t_total else 0.0,
+        "Tiempo_Total": t_total
     }
     return tabla, resumen
 
-# ---------------------------
-# Gestión de memoria lineal
-# ---------------------------
+
+# =========================
+# 4) Memoria lineal (FF/BF)
+# =========================
 @dataclass
 class Block:
     start: int
@@ -158,126 +139,119 @@ class Block:
     pid: Optional[int] = None
 
 class MemoryManager:
-    def __init__(self, size:int):
-        self.size = size
+    def __init__(self, size: int):
         self.blocks: List[Block] = [Block(0, size, True, None)]
 
-    def _coalesce(self):
-        merged: List[Block] = []
-        self.blocks.sort(key=lambda b: b.start)
-        for b in self.blocks:
-            if merged and merged[-1].free and b.free and merged[-1].start + merged[-1].size == b.start:
-                merged[-1].size += b.size
-            else:
-                merged.append(b)
-        self.blocks = merged
-
-    def _find_first_fit(self, req:int) -> Optional[int]:
+    def _find_first_fit(self, req: int) -> Optional[int]:
         for i, b in enumerate(self.blocks):
             if b.free and b.size >= req:
                 return i
         return None
 
-    def _find_best_fit(self, req:int) -> Optional[int]:
-        best_idx = None
-        best_size = None
+    def _find_best_fit(self, req: int) -> Optional[int]:
+        best_idx, best_size = None, None
         for i, b in enumerate(self.blocks):
             if b.free and b.size >= req:
                 if best_size is None or b.size < best_size:
                     best_idx, best_size = i, b.size
         return best_idx
 
-    def allocate(self, pid:int, req:int, strategy:str = "first-fit"):
+    def allocate(self, pid: int, req: int, strategy: str):
         idx = self._find_first_fit(req) if strategy == "first-fit" else self._find_best_fit(req)
         if idx is None:
-            return None
+            return None  # no encontrado
         b = self.blocks[idx]
         if b.size == req:
             b.free = False
             b.pid = pid
             chosen = b
         else:
-            alloc = Block(b.start, req, False, pid)
+            # split
+            chosen = Block(b.start, req, False, pid)
             rest = Block(b.start + req, b.size - req, True, None)
-            self.blocks[idx] = alloc
+            self.blocks[idx] = chosen
             self.blocks.insert(idx + 1, rest)
-            chosen = alloc
         return {"bloque_inicio": chosen.start, "tam_bloque": chosen.size}
 
-    def free_pid(self, pid:int):
-        changed = False
-        for b in self.blocks:
-            if not b.free and b.pid == pid:
-                b.free = True
-                b.pid = None
-                changed = True
-        if changed:
-            self._coalesce()
-        return changed
 
-# ---------------------------
-# CLI
-# ---------------------------
-def run_from_config(config: Dict[str, Any]):
-    # CPU
-    cpu_cfg = config.get("cpu", {})
-    alg = cpu_cfg.get("algoritmo", "FCFS")
-    q = cpu_cfg.get("quantum", 2)
-    if alg not in ("FCFS", "SPN", "RR"):
-        raise ValueError("Algoritmo inválido (FCFS | SPN | RR).")
-    if alg == "RR" and q < 2:
-        raise ValueError("Quantum debe ser ≥ 2 para RR.")
+# =========================
+# 5) Impresión ordenada
+# =========================
+def imprimir_tabla(tabla: List[Dict]):
+    print(f"{'PID':>3} | {'Llegada':>7} | {'Servicio':>8} | {'Inicio':>6} | {'Fin':>3} | {'Respuesta':>9} | {'Espera':>6} | {'Retorno':>7}")
+    print("-"*86)
+    for r in sorted(tabla, key=lambda x: x["PID"]):
+        print(f"{r['PID']:>3} | {r['Llegada']:>7} | {r['Servicio']:>8} | {r['Inicio']:>6} | {r['Fin']:>3} | {r['Respuesta']:>9} | {r['Espera']:>6} | {r['Retorno']:>7}")
 
-    raw_procs = config.get("procesos", [])
-    pids = set()
-    processes = []
-    for rp in raw_procs:
-        pid = rp["pid"]; llegada = rp["llegada"]; servicio = rp["servicio"]
-        if pid in pids:
-            raise ValueError("PID duplicado.")
+def imprimir_resumen(resumen: Dict):
+    print("\nResumen:")
+    print(f"{'Promedio_Respuesta':<20}: {resumen['Promedio_Respuesta']:.2f}")
+    print(f"{'Promedio_Espera':<20}: {resumen['Promedio_Espera']:.2f}")
+    print(f"{'Promedio_Retorno':<20}: {resumen['Promedio_Retorno']:.2f}")
+    print(f"{'Throughput':<20}: {resumen['Throughput']:.2f}")
+    print(f"{'Tiempo_Total':<20}: {resumen['Tiempo_Total']}")
+
+def imprimir_mem_asignaciones(mm: MemoryManager, solicitudes: List[Dict], estrategia: str):
+    print(f"\nAsignación de memoria (estrategia: {estrategia}):")
+    print(f"{'PID':>3} | {'tam':>9} | {'bloque_inicio':>13} | {'tam_bloque':>10}")
+    print("-"*50)
+    for r in solicitudes:
+        res = mm.allocate(r["pid"], r["tam"], estrategia)
+        if res is None:
+            print(f"{r['pid']:>3} | {r['tam']:>9} | {'no encontrado':>13} | {'-':>10}")
+        else:
+            print(f"{r['pid']:>3} | {r['tam']:>9} | {res['bloque_inicio']:>13} | {res['tam_bloque']:>10}")
+
+
+# =========================
+# 6) Orquestador (lee JSON)
+# =========================
+def run_from_config(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    cpu_cfg = cfg.get("cpu", {})
+    alg = cpu_cfg.get("algoritmo", "FCFS").upper()
+    quantum = int(cpu_cfg.get("quantum", 2))
+
+    procs = []
+    seen = set()
+    for p in cfg.get("procesos", []):
+        pid, llegada, servicio = p["pid"], p["llegada"], p["servicio"]
+        if pid in seen:
+            raise ValueError("PID duplicado en entrada.")
         if llegada < 0 or servicio < 1:
             raise ValueError("Llegada/Servicio inválidos.")
-        pids.add(pid)
-        processes.append(Process(pid=pid, llegada=llegada, servicio=servicio))
+        seen.add(pid)
+        procs.append(Process(pid, llegada, servicio))
 
-    tabla, resumen = simulate_cpu(processes, alg, q)
+    if alg == "FCFS":
+        finalizados = fcfs(procs)
+    elif alg == "SPN":
+        finalizados = spn(procs)
+    elif alg == "RR":
+        finalizados = rr(procs, quantum)
+    else:
+        raise ValueError("Algoritmo inválido. Use FCFS | SPN | RR")
 
-    # Salida CPU
-    headers = ["PID","Llegada","Servicio","Inicio","Fin","Respuesta","Espera","Retorno"]
-    print("PID | Llegada | Servicio | Inicio | Fin | Respuesta | Espera | Retorno")
-    print("--- | ------- | -------- | ------ | --- | --------- | ------ | -------")
-    for row in sorted(tabla, key=lambda r: r["PID"]):
-        print(" | ".join(str(row[h]) for h in headers))
+    tabla, resumen = calcular_metricas(finalizados)
+    imprimir_tabla(tabla)
+    imprimir_resumen(resumen)
 
-    print("\nResumen:")
-    for k, v in resumen.items():
-        print(f"- {k}: {v:.2f}" if isinstance(v, float) else f"- {k}: {v}")
-
-    # Memoria
-    mem_cfg = config.get("memoria", {})
-    M = mem_cfg.get("tam", 1048576)
-    strat = mem_cfg.get("estrategia", "first-fit")
-    if strat not in ("first-fit", "best-fit"):
+    mem_cfg = cfg.get("memoria", {})
+    M = int(mem_cfg.get("tam", 1048576))
+    estrategia = mem_cfg.get("estrategia", "first-fit").lower()
+    if estrategia not in ("first-fit", "best-fit"):
         raise ValueError("Estrategia de memoria inválida (first-fit | best-fit).")
-
     mm = MemoryManager(M)
-    reqs = config.get("solicitudes_mem", [])
+    imprimir_mem_asignaciones(mm, cfg.get("solicitudes_mem", []), estrategia)
 
-    print("\nAsignación de memoria:")
-    for r in reqs:
-        res = mm.allocate(r["pid"], r["tam"], strat)
-        if res is None:
-            print(f"- PID {r['pid']} tam={r['tam']}: no encontrado")
-        else:
-            print(f"- PID {r['pid']} tam={r['tam']}: bloque_inicio={res['bloque_inicio']} tam_bloque={res['tam_bloque']}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Simulador de SO (CPU + Memoria)")
-    parser.add_argument("--config", "-c", required=True, help="Ruta al archivo JSON de entrada")
-    args = parser.parse_args()
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    run_from_config(cfg)
-
+# =========================
+# 7) Main
+# =========================
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Simulador SO: CPU (FCFS/SPN/RR) + Memoria (FF/BF)")
+    parser.add_argument("--config", "-c", required=True, help="Ruta a archivo JSON de entrada")
+    args = parser.parse_args()
+    run_from_config(args.config)
